@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scrape company names and domains from cpgd.xyz/brandbuilders."""
+"""Scrape company names and domains from cpgd.xyz/brandbuilders (all pages)."""
 
 import csv
 import re
@@ -10,41 +10,57 @@ from urllib.parse import urlparse
 
 BASE_URL = "https://www.cpgd.xyz"
 
+# Pagination param discovered from the site
+PAGE_PARAM = "9d708921_page"
 
-def get_builders_from_listing():
-    """Get all builder names and slugs from the main directory page."""
-    resp = requests.get(f"{BASE_URL}/brandbuilders", timeout=30)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
 
+def get_builders_from_all_pages():
+    """Get all builder names and slugs from all paginated directory pages."""
     builders = []
     seen_slugs = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if href.startswith("/builder/"):
-            slug = href.replace("/builder/", "")
-            if slug and slug not in seen_slugs:
-                seen_slugs.add(slug)
-                # Try to get the company name from the link text or parent
-                name = a.get_text(strip=True)
-                # Sometimes the name is in a child element
-                if not name:
-                    # Check for text in child elements
-                    for child in a.descendants:
-                        if isinstance(child, str) and child.strip():
-                            name = child.strip()
-                            break
-                builders.append({"slug": slug, "name": name})
+    page = 1
+
+    while True:
+        if page == 1:
+            url = f"{BASE_URL}/brandbuilders"
+        else:
+            url = f"{BASE_URL}/brandbuilders?{PAGE_PARAM}={page}"
+
+        print(f"  Fetching page {page}: {url}")
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        page_builders = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("/builder/"):
+                slug = href.replace("/builder/", "")
+                if slug and slug not in seen_slugs:
+                    seen_slugs.add(slug)
+                    name = a.get_text(strip=True)
+                    if not name:
+                        for child in a.descendants:
+                            if isinstance(child, str) and child.strip():
+                                name = child.strip()
+                                break
+                    page_builders.append({"slug": slug, "name": name})
+
+        if not page_builders:
+            print(f"  Page {page} has no new builders, stopping.")
+            break
+
+        builders.extend(page_builders)
+        print(f"  Found {len(page_builders)} builders on page {page} (total: {len(builders)})")
+        page += 1
+
     return builders
 
 
 def slug_to_name(slug):
     """Convert a URL slug to a human-readable company name."""
-    # Remove trailing hash suffixes like '-b2f02' or '-c5ced' or '-16184' etc.
     cleaned = re.sub(r'-[a-f0-9]{5}$', '', slug)
-    # Replace hyphens with spaces and title case
     name = cleaned.replace("-", " ").title()
-    # Fix common patterns
     name = name.replace(" Llc", " LLC")
     name = name.replace(" Inc", " Inc.")
     name = name.replace(" Ltd", " Ltd.")
@@ -68,15 +84,13 @@ def scrape_builder_domain(slug):
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    domain = ""
-
     skip_patterns = [
         "cpgd.xyz", "twitter.com", "instagram.com", "tiktok.com",
         "linkedin.com", "facebook.com", "youtube.com", "webflow.com",
         "x.com",
     ]
 
-    # Strategy 1: Look for external links that aren't social media or cpgd
+    # Strategy 1: Look for external links that aren't social/cpgd
     external_links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -86,8 +100,11 @@ def scrape_builder_domain(slug):
             external_links.append(href)
 
     # Strategy 2: Look for text that looks like a domain
-    # Extended TLD list
-    tld_pattern = r'(?:com|co|io|xyz|net|org|agency|studio|design|dev|ai|inc|us|uk|ca|nyc|land|space|biz|consulting)'
+    tld_pattern = (
+        r'(?:com|co|io|xyz|net|org|agency|studio|design|dev|ai|inc|us|uk|ca|nyc|'
+        r'land|space|biz|consulting|cc|gg|marketing|media|digital|group|works|'
+        r'so|ly|me|tv|app|pro|tech|ventures|world)'
+    )
     domain_pattern = re.compile(
         r'\b([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.' + tld_pattern + r'(?:\.[a-z]{2})?)\b'
     )
@@ -109,7 +126,7 @@ def scrape_builder_domain(slug):
         if d not in skip_domains and not d.endswith("cpgd.xyz"):
             candidate_domains.append(d)
 
-    # Strategy 3: Look for mailto links to extract domain
+    # Strategy 3: Look for mailto links
     email_domain = ""
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -118,8 +135,8 @@ def scrape_builder_domain(slug):
             if "@" in email:
                 email_domain = email.split("@")[1]
 
-    # Priority: domain text in page > external link > email domain
-    # Domain text is often the most reliable as it's displayed on the page
+    # Pick best domain
+    domain = ""
     if candidate_domains:
         domain = candidate_domains[0]
     elif external_links:
@@ -128,19 +145,33 @@ def scrape_builder_domain(slug):
     elif email_domain:
         domain = email_domain
 
+    # Clean up: remove any "http" or "https" only results
+    if domain in ("http", "https", ""):
+        # Try harder with external links
+        if external_links:
+            parsed = urlparse(external_links[0])
+            d = parsed.netloc.replace("www.", "")
+            if d and d not in ("http", "https"):
+                domain = d
+        elif email_domain:
+            domain = email_domain
+        else:
+            domain = ""
+
     return {"slug": slug, "domain": domain, "error": ""}
 
 
 def main():
-    print("Fetching builder listing...")
-    builders = get_builders_from_listing()
-    print(f"Found {len(builders)} builders")
+    print("Fetching all builder listings (paginated)...")
+    builders = get_builders_from_all_pages()
+    print(f"\nTotal builders found across all pages: {len(builders)}")
 
     # Scrape domains from individual pages
     results = []
     slug_to_builder = {b["slug"]: b for b in builders}
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    print(f"\nScraping {len(builders)} individual profile pages...")
+    with ThreadPoolExecutor(max_workers=8) as executor:
         future_to_slug = {
             executor.submit(scrape_builder_domain, b["slug"]): b["slug"]
             for b in builders
@@ -151,7 +182,6 @@ def main():
             slug = result["slug"]
             builder = slug_to_builder[slug]
 
-            # Use listing name, fall back to slug-derived name
             name = builder.get("name", "") or slug_to_name(slug)
 
             results.append({
@@ -161,7 +191,7 @@ def main():
                 "error": result.get("error", ""),
             })
 
-            if (i + 1) % 10 == 0:
+            if (i + 1) % 25 == 0:
                 print(f"  Scraped {i + 1}/{len(builders)}...")
 
     # Sort by original order
@@ -183,10 +213,10 @@ def main():
     print(f"Companies without domain: {len(results) - with_domain}")
 
     # Print table
-    print(f"\n{'Company Name':<50} {'Domain':<40}")
-    print("-" * 90)
-    for r in results:
-        print(f"{r['name']:<50} {r['domain']:<40}")
+    print(f"\n{'#':<5} {'Company Name':<55} {'Domain':<40}")
+    print("-" * 100)
+    for i, r in enumerate(results, 1):
+        print(f"{i:<5} {r['name']:<55} {r['domain']:<40}")
 
 
 if __name__ == "__main__":
